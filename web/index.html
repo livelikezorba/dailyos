@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DailyOS</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Ccircle cx='24' cy='24' r='24' fill='%233B5BDB'/%3E%3Cpath d='M20 35l-10-10 2.8-2.8 7.2 7.1 15.2-15.1L38 17z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="config.js"></script>
+</head>
+<body>
+<div id="login" class="login hidden">
+  <div class="login-card">
+    <h1>DailyOS</h1>
+    <p class="muted">Supabase에 만든 계정으로 로그인하세요</p>
+    <form id="login-form">
+      <input id="email" type="email" placeholder="이메일" autocomplete="username" required>
+      <input id="password" type="password" placeholder="비밀번호" autocomplete="current-password" required>
+      <button class="primary" type="submit">로그인</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header class="topbar">
+    <div class="brand">DailyOS</div>
+    <nav id="tabs">
+      <button data-tab="today" class="active">오늘</button>
+      <button data-tab="report">리포트</button>
+      <button data-tab="usage">사용량</button>
+      <button data-tab="settings">설정</button>
+    </nav>
+    <button id="logout" class="ghost small">로그아웃</button>
+  </header>
+  <main>
+    <section id="tab-today" class="tab"></section>
+    <section id="tab-report" class="tab hidden"></section>
+    <section id="tab-usage" class="tab hidden"></section>
+    <section id="tab-settings" class="tab hidden"></section>
+  </main>
+  <div id="toast" class="toast hidden"></div>
+</div>
+
+<dialog id="item-dialog">
+  <form id="item-form" method="dialog">
+    <h3 id="item-dialog-title">루틴 항목</h3>
+    <label>이름<input name="name" required placeholder="예: 영양제 A"></label>
+    <label>영역<select name="category_id"></select></label>
+    <div class="row2">
+      <label>유형
+        <select name="kind">
+          <option value="check">체크 (했다/안 했다)</option>
+          <option value="number">수치 (개수·분 등)</option>
+        </select>
+      </label>
+      <label class="num-only">단위<input name="unit" placeholder="개, 분, 쪽"></label>
+    </div>
+    <label class="num-only">하루 목표<input name="target" type="number" step="any" placeholder="예: 30"></label>
+    <label>알림 시각 <span class="muted">(쉼표로 여러 개)</span><input name="reminder_times" placeholder="08:00, 21:30"></label>
+    <div class="days">
+      <span class="muted">요일</span>
+      <label><input type="checkbox" name="d1">월</label><label><input type="checkbox" name="d2">화</label>
+      <label><input type="checkbox" name="d3">수</label><label><input type="checkbox" name="d4">목</label>
+      <label><input type="checkbox" name="d5">금</label><label><input type="checkbox" name="d6">토</label>
+      <label><input type="checkbox" name="d7">일</label>
+    </div>
+    <div class="row2">
+      <label>정렬 순서<input name="sort" type="number" value="0"></label>
+      <label class="inline"><input type="checkbox" name="active" checked> 사용 중</label>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" id="item-delete" class="danger ghost">삭제</button>
+      <span class="spacer"></span>
+      <button value="cancel" formnovalidate class="ghost">취소</button>
+      <button value="save" class="primary">저장</button>
+    </div>
+  </form>
+</dialog>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
