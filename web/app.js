@@ -1,4 +1,5 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+import { mergeSettings, logicalToday, computeSleep, dayScore, requiredNew, fmtClock, fmtHours } from './metrics.js';
 
 // ───────────────────────── 설정 ─────────────────────────
 const CFG = window.DAILYOS_CONFIG || {};
@@ -26,7 +27,7 @@ const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0
 const parseYmd = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 const addDays = (s, n) => { const d = parseYmd(s); d.setDate(d.getDate() + n); return ymd(d); };
 const isoDow = (s) => ((parseYmd(s).getDay() + 6) % 7) + 1; // 1=월 … 7=일
-const today = () => ymd(new Date());
+const today = () => logicalToday(); // 새벽 4시 이전은 전날
 const dayRange = (from, to) => { const out = []; for (let d = from; d <= to; d = addDays(d, 1)) out.push(d); return out; };
 const fmtDay = (s) => { const d = parseYmd(s); return `${d.getMonth() + 1}/${d.getDate()}`; };
 const weekStart = (s) => addDays(s, 1 - isoDow(s));
@@ -38,6 +39,7 @@ const fmtMin = (m) => (m >= 60 ? `${Math.floor(m / 60)}시간 ${m % 60}분` : `$
 const state = {
   user: null, categories: [], items: [], limits: [], devices: [],
   todayDate: today(), reportDays: 30, usageDays: 7, trendItem: null,
+  settingsRaw: {}, settings: mergeSettings({}), calMonth: today().slice(0, 7), calSel: today(), calData: {},
 };
 const charts = {};
 
@@ -77,13 +79,15 @@ const sortedItems = () => [...state.items].sort((a, b) => {
 });
 
 async function loadMeta() {
-  const [cats, items, limits, devices] = await Promise.all([
+  const [cats, items, limits, devices, us] = await Promise.all([
     run(sb.from('categories').select('*').order('sort').order('name')),
     run(sb.from('items').select('*')),
     run(sb.from('usage_limits').select('*').order('label')),
     run(sb.from('devices').select('*').order('last_seen', { ascending: false })),
+    run(sb.from('user_settings').select('data')),
   ]);
-  Object.assign(state, { categories: cats, items, limits, devices });
+  const raw = us[0]?.data || {};
+  Object.assign(state, { categories: cats, items, limits, devices, settingsRaw: raw, settings: mergeSettings(raw) });
 }
 const logsBetween = (from, to) =>
   fetchAll(() => sb.from('logs').select('item_id,day,done,value').gte('day', from).lte('day', to).order('day'));
@@ -109,7 +113,7 @@ async function enterApp() {
   $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
   await loadMeta();
   const saved = (() => { try { return localStorage.getItem('dailyos.tab'); } catch { return null; } })();
-  showTab(saved || (state.items.length ? 'today' : 'settings'));
+  showTab(saved || 'calendar');
 }
 
 $('#tabs').addEventListener('click', (e) => { const b = e.target.closest('button[data-tab]'); if (b) showTab(b.dataset.tab); });
@@ -117,7 +121,245 @@ function showTab(tab) {
   $$('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $$('.tab').forEach((s) => s.classList.toggle('hidden', s.id !== 'tab-' + tab));
   try { localStorage.setItem('dailyos.tab', tab); } catch {}
-  ({ today: renderToday, report: renderReport, usage: renderUsage, settings: renderSettings })[tab]();
+  ({ calendar: renderCalendar, today: renderToday, report: renderReport, usage: renderUsage, settings: renderSettings }[tab] || renderCalendar)();
+}
+
+// ═════════════════════════ 지표 (일본어·건강·잠·점수) ═════════════════════════
+const AREA = { jp: '#eb6834', health: '#1baf7a', sleep: '#4a3aa7' };
+const pts = (v) => Math.round(v);
+
+async function loadMetrics(from, to) {
+  const pk = state.limits.map((l) => l.package);
+  const [anki, health, nights, usage] = await Promise.all([
+    fetchAll(() => sb.from('anki_daily').select('*').gte('day', from).lte('day', to)),
+    fetchAll(() => sb.from('health_log').select('*').gte('day', from).lte('day', to)),
+    fetchAll(() => sb.from('night_activity').select('day,device_id,sessions').gte('day', from).lte('day', to)),
+    pk.length ? fetchAll(() => sb.from('app_usage').select('day,package,minutes').gte('day', from).lte('day', to).in('package', pk)) : Promise.resolve([]),
+  ]);
+  const S = state.settings;
+  const limit = state.limits.reduce((a, l) => a + l.daily_limit_min, 0);
+  const calToday = ymd(new Date());
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const out = {};
+  for (const d of dayRange(from, to)) {
+    const a = anki.find((r) => r.day === d) || null;
+    const h = health.find((r) => r.day === d) || null;
+    const sessions = nights.filter((r) => r.day === d).flatMap((r) => r.sessions || []);
+    const sleep = d > calToday ? null : computeSleep(sessions, d === calToday ? nowMin : null);
+    const used = usage.filter((r) => r.day === d).reduce((x, r) => x + r.minutes, 0);
+    const score = d > today() ? null : dayScore(S, { anki: a, health: h, sleep, phone: { used, limit } });
+    out[d] = { day: d, anki: a, health: h, sleep, used, limit, score };
+  }
+  return out;
+}
+
+async function renderCalendar() {
+  const el = $('#tab-calendar');
+  const [y, m] = state.calMonth.split('-').map(Number);
+  const first = `${state.calMonth}-01`;
+  const last = ymd(new Date(y, m, 0));
+  state.calData = await loadMetrics(first, last);
+  if (!state.calData[state.calSel]) Object.assign(state.calData, await loadMetrics(state.calSel, state.calSel));
+  const offset = isoDow(first) - 1;
+  const days = dayRange(first, last);
+  const t = today();
+  const heat = (score) => (score == null ? 'transparent' : `color-mix(in srgb, var(--accent) ${Math.round(score * 0.32)}%, var(--surface))`);
+
+  const cells = [];
+  for (let i = 0; i < offset; i++) cells.push('<div class="cal-cell empty"></div>');
+  for (const d of days) {
+    const x = state.calData[d];
+    const future = d > t;
+    const a = x?.anki, h = x?.health, sl = x?.sleep, sc = x?.score;
+    const lines = [];
+    if (!future) {
+      if (a) {
+        lines.push(`<span class="dot" style="background:${AREA.jp}"></span>新 ${a.new_studied ?? 0}/${a.required_new ?? '–'}`);
+        lines.push(`<span class="dot" style="background:${AREA.jp}"></span>復 ${a.reviewed ?? 0}${a.due_left ? `<small>+${a.due_left}</small>` : ''}`);
+      }
+      if (h && (h.walk_min || h.pushups)) lines.push(`<span class="dot" style="background:${AREA.health}"></span>🚶${fmtNum(h.walk_min)} 💪${h.pushups ?? 0}`);
+      if (h && (h.pain_am != null || h.pain_pm != null)) lines.push(`<span class="dot" style="background:${AREA.health}"></span>통증 ${h.pain_am ?? '–'}/${h.pain_pm ?? '–'}`);
+      if (sl?.minutes != null) lines.push(`<span class="dot" style="background:${AREA.sleep}"></span>😴${(sl.minutes / 60).toFixed(1)}h`);
+    }
+    cells.push(`<button class="cal-cell ${d === state.calSel ? 'sel' : ''} ${d === t ? 'today' : ''} ${future ? 'future' : ''}" data-day="${d}" style="background:${heat(sc?.total)}">
+      <div class="cal-top"><span class="cal-date">${+d.slice(8)}</span>${sc ? `<span class="cal-score">${sc.total}</span>` : ''}</div>
+      ${lines.map((l) => `<div class="cal-line">${l}</div>`).join('')}
+    </button>`);
+  }
+
+  el.innerHTML = `
+    <div class="toolbar">
+      <div class="title">${y}년 ${m}월</div>
+      <button class="small" data-mnav="-1">‹</button>
+      <button class="small" data-mnav="0">오늘</button>
+      <button class="small" data-mnav="1">›</button>
+    </div>
+    <div class="cal-wrap">
+      <div class="card cal-card">
+        <div class="cal-grid cal-head">${DOW.map((w, i) => `<div class="${i >= 5 ? 'weekend' : ''}">${w}</div>`).join('')}</div>
+        <div class="cal-grid">${cells.join('')}</div>
+        <div class="cal-legend"><span><span class="dot" style="background:${AREA.jp}"></span>일본어 新=새 카드(한 것/목표) 復=복습</span>
+          <span><span class="dot" style="background:${AREA.health}"></span>건강 (걷기분·푸시업·통증 아침/저녁)</span>
+          <span><span class="dot" style="background:${AREA.sleep}"></span>잠</span><span>오른쪽 위 숫자 = 생산성 점수 · 배경이 진할수록 높음</span></div>
+      </div>
+      <div id="cal-detail"></div>
+    </div>`;
+
+  el.querySelectorAll('[data-mnav]').forEach((b) => b.addEventListener('click', () => {
+    const n = +b.dataset.mnav;
+    if (n === 0) { state.calMonth = t.slice(0, 7); state.calSel = t; }
+    else { const dt = new Date(y, m - 1 + n, 1); state.calMonth = ymd(dt).slice(0, 7); }
+    renderCalendar();
+  }));
+  el.querySelectorAll('.cal-cell[data-day]').forEach((c) => c.addEventListener('click', () => {
+    state.calSel = c.dataset.day;
+    el.querySelectorAll('.cal-cell').forEach((x) => x.classList.toggle('sel', x.dataset.day === state.calSel));
+    renderDayDetail();
+  }));
+  renderDayDetail();
+}
+
+async function renderDayDetail() {
+  const box = $('#cal-detail');
+  const d = state.calSel;
+  const x = state.calData[d] || {};
+  const S = state.settings, W = S.weights;
+  const editable = d <= today();
+  const usage = await run(sb.from('app_usage').select('device_id,package,label,minutes').eq('day', d));
+  const devName = (id) => state.devices.find((v) => v.device_id === id)?.name ?? '폰';
+  const byPkg = {};
+  for (const r of usage) (byPkg[r.package] ||= { label: r.label || r.package, total: 0, rows: [] }, byPkg[r.package].total += r.minutes, byPkg[r.package].rows.push(r));
+  const apps = Object.entries(byPkg).sort((a, b) => b[1].total - a[1].total).slice(0, 8);
+  const a = x.anki, h = x.health || {}, sl = x.sleep, sc = x.score;
+  const dd = parseYmd(d);
+  const dLeft = Math.round((Date.parse(S.anki_target) - Date.parse(d)) / 86400000);
+  const warn = (ok) => (ok ? '' : ' class="miss"');
+
+  box.innerHTML = `
+    <div class="card detail">
+      <div class="muted">${dd.getMonth() + 1}월 ${dd.getDate()}일 (${DOW[isoDow(d) - 1]})</div>
+      <h2>${sc ? `생산성 ${sc.total}점` : '기록 없음'}</h2>
+      ${sc ? `<div class="score-bars">${[['jp', '일본어'], ['ex', '운동'], ['sleep', '잠'], ['phone', '폰 절제'], ['rec', '기록']].map(([k, n]) => `
+        <div class="sb-row"><span>${n}</span><div class="bar"><span style="width:${(sc.ratios[k] || 0) * 100}%"></span></div><b>${pts(sc.parts[k])}/${W[k]}</b></div>`).join('')}</div>` : ''}
+
+      <h3 class="area"><span class="dot" style="background:${AREA.jp}"></span>일본어 (Anki)</h3>
+      ${a ? `<div class="kv"><span${warn((a.new_studied ?? 0) >= (a.required_new ?? 0))}>새 카드</span><b>${a.new_studied ?? 0} / 목표 ${a.required_new ?? '–'}</b></div>
+        <div class="kv"><span>복습</span><b>${a.reviewed ?? 0}장${a.due_left != null ? ` · 남은 ${a.due_left}` : ''}</b></div>
+        ${a.remaining_new != null ? `<div class="kv"><span>남은 새 카드</span><b>${a.remaining_new}장 · ${esc(S.anki_target)} (D-${dLeft})</b></div>` : ''}
+        ${a.total_cards != null ? `<div class="kv"><span>암기 완료</span><b>${a.mature ?? 0} / ${a.total_cards}</b></div>` : ''}
+        ${(a.reviewed ?? 0) >= S.anki_review_warn ? `<p class="error">⚠️ 복습 ${a.reviewed}장 — 새 카드 수를 줄이는 걸 고려하세요</p>` : ''}`
+        : '<p class="muted">Anki 기록 없음 (Anki를 쓰는 폰에서 DailyOS의 Anki 연결을 허용하세요)</p>'}
+
+      <h3 class="area"><span class="dot" style="background:${AREA.health}"></span>건강 (허리)</h3>
+      <div class="kv"><span${warn((+h.walk_min || 0) >= S.walk_goal_min)}>🚶 걷기</span><b>${fmtNum(h.walk_min)} / ${S.walk_goal_min}분${h.walk_km ? ` · ${fmtNum(h.walk_km)}km` : ''}</b></div>
+      <div class="kv"><span${warn((h.pushups || 0) >= S.pushup_goal)}>💪 푸시업</span><b>${h.pushups ?? 0} / ${S.pushup_goal}개</b></div>
+      <div class="kv"><span>🩺 통증 아침</span><b>${h.pain_am ?? '–'}${h.note_am ? ` · ${esc(h.note_am)}` : ''}</b></div>
+      <div class="kv"><span>🩺 통증 저녁</span><b>${h.pain_pm ?? '–'}${h.note_pm ? ` · ${esc(h.note_pm)}` : ''}</b></div>
+      ${editable ? `<div class="inputs">
+        <div class="in-row"><input id="in-walk" type="number" step="any" placeholder="걷기 분"><input id="in-km" type="number" step="any" placeholder="km"><input id="in-push" type="number" placeholder="푸시업"><button class="small primary" id="btn-health">더하기</button></div>
+        <div class="in-row"><select id="in-when"><option value="am">아침</option><option value="pm" ${new Date().getHours() >= 15 ? 'selected' : ''}>저녁</option></select>
+          <input id="in-pain" type="number" min="0" max="10" placeholder="통증 0~10"><input id="in-note" placeholder="메모"><button class="small primary" id="btn-pain">저장</button></div>
+        <p class="muted">걷기·푸시업은 입력한 만큼 더해져요 (빼려면 음수)</p></div>` : ''}
+
+      <h3 class="area"><span class="dot" style="background:${AREA.sleep}"></span>잠</h3>
+      ${!sl ? '<p class="muted">데이터 없음</p>'
+        : sl.status === 'ok' ? `<div class="kv"><span${warn(sl.minutes >= S.sleep_goal_min)}>${fmtClock(sl.start)} → ${fmtClock(sl.end)}</span><b>${fmtHours(sl.minutes)}</b></div><p class="muted">목표 ${S.sleep_goal_min / 60}시간 · 두 폰 모두 안 쓴 시간 기준</p>`
+        : sl.status === 'pending' ? `<p class="muted">측정 중 · 마지막 사용 ${fmtClock(sl.start)}</p>`
+        : `<p class="muted">기상 기록 없음 · 잠든 시각 ${fmtClock(sl.start)}</p>`}
+
+      <h3 class="area">📱 앱 사용량 (두 폰 합산)</h3>
+      ${state.limits.map((l) => { const u = byPkg[l.package]?.total || 0; return `<div class="kv"><span${warn(u <= l.daily_limit_min)}>${esc(l.label)}</span><b>${u} / ${l.daily_limit_min}분</b></div>`; }).join('')}
+      ${apps.length ? apps.map(([pkg, v]) => `<div class="kv"><span>${esc(v.label)}</span><b>${fmtMin(v.total)}<small class="muted"> ${v.rows.length > 1 ? v.rows.map((r) => `${esc(devName(r.device_id))} ${r.minutes}`).join(' · ') : esc(devName(v.rows[0].device_id))}</small></b></div>`).join('') : '<p class="muted">기록 없음</p>'}
+    </div>`;
+
+  $('#btn-health')?.addEventListener('click', async () => {
+    const w = parseFloat($('#in-walk').value) || 0, k = parseFloat($('#in-km').value) || 0, p = parseInt($('#in-push').value) || 0;
+    if (!w && !k && !p) return toast('숫자를 입력하세요');
+    await run(sb.rpc('add_health', { p_day: d, p_walk_min: w, p_walk_km: k, p_pushups: p }));
+    toast('저장됨'); renderCalendar();
+  });
+  $('#btn-pain')?.addEventListener('click', async () => {
+    const v = parseInt($('#in-pain').value);
+    if (Number.isNaN(v) || v < 0 || v > 10) return toast('통증은 0~10');
+    const wk = $('#in-when').value;
+    await run(sb.from('health_log').upsert({ user_id: state.user.id, day: d, [`pain_${wk}`]: v, [`note_${wk}`]: $('#in-note').value.trim(), updated_at: new Date().toISOString() }, { onConflict: 'user_id,day' }));
+    toast('저장됨'); renderCalendar();
+  });
+}
+
+async function saveSettings(patch) {
+  const { data } = await sb.from('user_settings').select('data');
+  const raw = { ...(data?.[0]?.data || {}), ...patch };
+  await run(sb.from('user_settings').upsert({ user_id: state.user.id, data: raw, updated_at: new Date().toISOString() }, { onConflict: 'user_id' }));
+  state.settingsRaw = raw; state.settings = mergeSettings(raw);
+}
+
+function goalsCardHtml() {
+  const S = state.settings, W = S.weights;
+  const avail = [...new Set([...(state.settingsRaw.anki_available || []), ...S.anki_decks])];
+  return `<div class="card"><h3>목표 설정</h3><p class="muted">폰 앱과 같이 쓰여요. 저장하면 폰에는 15분 안에 반영돼요.</p>
+    <div class="goal-grid">
+      <div class="full"><b>추적할 Anki 덱</b> <span class="muted">(폰에서 Anki 연결 후 목록이 채워져요)</span>
+        <div class="deck-list">${avail.map((n) => `<label class="inline"><input type="checkbox" class="g-deck" value="${esc(n)}" ${S.anki_decks.includes(n) ? 'checked' : ''}> ${esc(n)}</label>`).join('')}</div>
+        <input id="g-deck-add" placeholder="덱 이름 직접 추가 (Anki에 보이는 그대로)"></div>
+      <label>새 카드 완료 목표일<input id="g-target" type="date" value="${esc(S.anki_target)}"></label>
+      <label>복습 과부하 경고 (장)<input id="g-warn" type="number" value="${S.anki_review_warn}"></label>
+      <label>목표 수면 (시간)<input id="g-sleep" type="number" step="0.5" value="${S.sleep_goal_min / 60}"></label>
+      <label>걷기 목표 (분)<input id="g-walk" type="number" value="${S.walk_goal_min}"></label>
+      <label>푸시업 목표 (개)<input id="g-push" type="number" value="${S.pushup_goal}"></label>
+      <div class="full"><b>점수 비중</b> <span class="muted">(합계 100)</span><div class="w-row">
+        ${[['jp', '일본어'], ['ex', '운동'], ['sleep', '잠'], ['phone', '폰 절제'], ['rec', '기록']].map(([k, n]) => `<label>${n}<input class="g-w" data-k="${k}" type="number" value="${W[k]}"></label>`).join('')}
+        <span id="g-wsum" class="muted"></span></div></div>
+    </div>
+    <button class="primary" id="g-save" style="margin-top:10px">목표 저장</button></div>`;
+}
+
+function bindGoals(rerender) {
+  const sum = () => $$('.g-w').reduce((a, i) => a + (+i.value || 0), 0);
+  const upd = () => { const s = sum(); $('#g-wsum').textContent = `합계 ${s}`; $('#g-wsum').className = s === 100 ? 'muted' : 'error'; };
+  $$('.g-w').forEach((i) => i.addEventListener('input', upd)); upd();
+  $('#g-save').addEventListener('click', async () => {
+    if (sum() !== 100) return toast('점수 비중 합계를 100으로 맞춰주세요');
+    const decks = $$('.g-deck').filter((c) => c.checked).map((c) => c.value);
+    const add = $('#g-deck-add').value.trim(); if (add && !decks.includes(add)) decks.push(add);
+    const weights = Object.fromEntries($$('.g-w').map((i) => [i.dataset.k, +i.value]));
+    await saveSettings({
+      anki_decks: decks, anki_target: $('#g-target').value, anki_review_warn: +$('#g-warn').value || 250,
+      sleep_goal_min: Math.round((+$('#g-sleep').value || 7) * 60), walk_goal_min: +$('#g-walk').value || 60,
+      pushup_goal: +$('#g-push').value || 20, weights,
+    });
+    toast('목표 저장됨'); rerender();
+  });
+}
+
+async function metricChartsHtml(from, to) {
+  const data = await loadMetrics(from, to);
+  const ds = dayRange(from, to).filter((d) => d <= today());
+  return { data, ds };
+}
+
+function drawMetricCharts(data, ds) {
+  const S = state.settings;
+  const lab = ds.map(fmtDay);
+  const v = (f) => ds.map((d) => { const r = f(data[d]); return r == null || Number.isNaN(r) ? null : r; });
+  drawChart('m-score', { type: 'line', data: { labels: lab, datasets: [{ label: '생산성 점수', data: v((x) => x?.score?.total), borderColor: cssVar('--accent'), backgroundColor: cssVar('--accent'), borderWidth: 2, pointRadius: 0, pointHoverRadius: 5, tension: 0.25, spanGaps: true }] }, options: { ...baseOptions({ max: 100, suffix: '점' }), plugins: { ...baseOptions().plugins, legend: { display: false } } } });
+  drawChart('m-anki', { type: 'bar', data: { labels: lab, datasets: [
+    { label: '새 카드', data: v((x) => x?.anki?.new_studied), backgroundColor: AREA.jp, borderRadius: 4, maxBarThickness: 22 },
+    { type: 'line', label: '목표', data: v((x) => x?.anki?.required_new), borderColor: cssVar('--muted'), borderDash: [5, 4], borderWidth: 2, pointRadius: 0 },
+  ] }, options: baseOptions({ suffix: '장' }) });
+  drawChart('m-sleep', { type: 'bar', data: { labels: lab, datasets: [
+    { label: '수면', data: v((x) => (x?.sleep?.minutes != null ? +(x.sleep.minutes / 60).toFixed(1) : null)), backgroundColor: AREA.sleep, borderRadius: 4, maxBarThickness: 22 },
+    { type: 'line', label: '목표', data: ds.map(() => S.sleep_goal_min / 60), borderColor: cssVar('--muted'), borderDash: [5, 4], borderWidth: 2, pointRadius: 0 },
+  ] }, options: baseOptions({ suffix: 'h' }) });
+  drawChart('m-walk', { type: 'bar', data: { labels: lab, datasets: [
+    { label: '걷기', data: v((x) => (x?.health?.walk_min != null ? +x.health.walk_min : null)), backgroundColor: AREA.health, borderRadius: 4, maxBarThickness: 22 },
+    { type: 'line', label: '목표', data: ds.map(() => S.walk_goal_min), borderColor: cssVar('--muted'), borderDash: [5, 4], borderWidth: 2, pointRadius: 0 },
+  ] }, options: baseOptions({ suffix: '분' }) });
+  drawChart('m-pain', { type: 'line', data: { labels: lab, datasets: [
+    { label: '아침', data: v((x) => x?.health?.pain_am), borderColor: seriesColor(0), backgroundColor: seriesColor(0), borderWidth: 2, pointRadius: 3, spanGaps: true },
+    { label: '저녁', data: v((x) => x?.health?.pain_pm), borderColor: seriesColor(1), backgroundColor: seriesColor(1), borderWidth: 2, pointRadius: 3, spanGaps: true },
+  ] }, options: baseOptions({ max: 10, suffix: '' }) });
 }
 
 // ═════════════════════════ 오늘 ═════════════════════════
@@ -263,6 +505,15 @@ async function renderReport() {
       <div class="title">리포트</div>
       <div class="seg">${[7, 30, 90].map((n) => `<button data-range="${n}" class="${state.reportDays === n ? 'active' : ''}">${n}일</button>`).join('')}</div>
     </div>
+    <h3 style="margin:4px 0 10px">핵심 지표</h3>
+    <div class="grid cols-2" style="margin-bottom:22px">
+      <div class="card"><h3>생산성 점수</h3><div class="chart-box" style="height:220px"><canvas id="m-score"></canvas></div></div>
+      <div class="card"><h3><span class="dot" style="background:${AREA.jp}"></span>일본어 · 새 카드 vs 목표</h3><div class="chart-box" style="height:220px"><canvas id="m-anki"></canvas></div></div>
+      <div class="card"><h3><span class="dot" style="background:${AREA.sleep}"></span>수면 시간</h3><div class="chart-box" style="height:220px"><canvas id="m-sleep"></canvas></div></div>
+      <div class="card"><h3><span class="dot" style="background:${AREA.health}"></span>걷기</h3><div class="chart-box" style="height:220px"><canvas id="m-walk"></canvas></div></div>
+      <div class="card"><h3><span class="dot" style="background:${AREA.health}"></span>허리 통증 (0~10)</h3><div class="chart-box" style="height:220px"><canvas id="m-pain"></canvas></div></div>
+    </div>
+    <h3 style="margin:4px 0 10px">루틴</h3>
     <div class="grid tiles">
       <div class="card tile"><div class="label">전체 달성률</div><div class="value">${pct(totalDone, totalSch)}%</div><div class="sub">${totalDone} / ${totalSch}건</div></div>
       <div class="card tile"><div class="label">완벽한 날</div><div class="value">${perfect}일</div><div class="sub">모든 루틴 달성</div></div>
@@ -311,6 +562,7 @@ async function renderReport() {
       }).join('')}</tbody></table></div></div>`;
 
   el.querySelectorAll('[data-range]').forEach((b) => b.addEventListener('click', () => { state.reportDays = +b.dataset.range; renderReport(); }));
+  metricChartsHtml(from, to).then(({ data, ds }) => drawMetricCharts(data, ds));
   $('#trend-select')?.addEventListener('change', (e) => { state.trendItem = e.target.value; renderReport(); });
 
   // 히트맵 (최소 13주)
@@ -423,7 +675,9 @@ async function renderSettings() {
     <div class="toolbar"><div class="title">설정</div>
       ${state.categories.length ? '' : '<button class="primary" id="seed">기본 템플릿으로 시작하기</button>'}</div>
 
-    <div class="card"><h3>영역</h3><p class="muted">투자·건강·일본어·커리어 같은 큰 분류예요.</p>
+    ${goalsCardHtml()}
+
+    <div class="card" style="margin-top:14px"><h3>영역</h3><p class="muted">투자·건강·일본어·커리어 같은 큰 분류예요.</p>
       <div id="cat-list">${state.categories.map((c) => `
         <div class="set-row" data-cat="${c.id}">
           <input type="color" value="${esc(c.color)}" data-f="color">
@@ -505,6 +759,7 @@ async function renderSettings() {
   $('#add-item')?.addEventListener('click', () => openItemDialog(null));
   el.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', () => openItemDialog(state.items.find((i) => i.id === b.dataset.edit))));
   $('#seed')?.addEventListener('click', seedTemplate);
+  bindGoals(renderSettings);
 }
 
 // 항목 편집 다이얼로그

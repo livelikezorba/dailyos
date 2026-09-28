@@ -51,7 +51,8 @@ object Prefs {
     }
 }
 
-fun today(): String = LocalDate.now().toString()
+/** 새벽 4시 이전은 전날로 취급 (Anki와 동일한 하루 기준) */
+fun today(): String = java.time.LocalDateTime.now().minusHours(4).toLocalDate().toString()
 
 class HttpError(val code: Int, val body: String) : IOException("HTTP $code: ${body.take(300)}")
 class NotLoggedIn : IOException("로그인이 필요합니다")
@@ -218,6 +219,14 @@ object Repo {
     fun addValue(itemId: String, day: String, delta: Double) =
         runOrQueue(JSONObject().put("op", "add").put("item", itemId).put("day", day).put("delta", delta))
 
+    fun addHealth(day: String, walkMin: Double = 0.0, walkKm: Double = 0.0, pushups: Int = 0) =
+        runOrQueue(JSONObject().put("op", "hadd").put("item", "").put("day", day)
+            .put("walk", walkMin).put("km", walkKm).put("push", pushups))
+
+    fun setPain(day: String, whenKey: String, score: Int, note: String) =
+        runOrQueue(JSONObject().put("op", "pain").put("item", "").put("day", day)
+            .put("when", whenKey).put("score", score).put("note", note))
+
     fun setValue(itemId: String, day: String, value: Double, target: Double?) =
         runOrQueue(
             JSONObject().put("op", "set").put("item", itemId).put("day", day).put("value", value)
@@ -238,6 +247,18 @@ object Repo {
                     .put("device", Prefs.deviceName)
                     .put("updated_at", java.time.OffsetDateTime.now().toString()), "item_id,day"
             )
+            "hadd" -> Supa.rpc(
+                "add_health", JSONObject().put("p_day", day).put("p_walk_min", op.optDouble("walk", 0.0))
+                    .put("p_walk_km", op.optDouble("km", 0.0)).put("p_pushups", op.optInt("push", 0))
+            )
+            "pain" -> {
+                val suffix = op.getString("when") // am / pm
+                Supa.upsert(
+                    "health_log", JSONObject().put("user_id", Supa.userId).put("day", day)
+                        .put("pain_$suffix", op.getInt("score")).put("note_$suffix", op.optString("note", ""))
+                        .put("updated_at", java.time.OffsetDateTime.now().toString()), "user_id,day"
+                )
+            }
             "add" -> Supa.rpc(
                 "add_log_value", JSONObject().put("p_item", item).put("p_day", day)
                     .put("p_delta", op.getDouble("delta")).put("p_device", Prefs.deviceName)

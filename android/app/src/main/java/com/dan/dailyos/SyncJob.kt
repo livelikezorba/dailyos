@@ -48,14 +48,44 @@ class SyncJob : JobService() {
             val day = today()
             Reminders.dismissCompleted(ctx, items, Repo.fetchLogs(day))
 
+            Daily.scheduleNext(ctx)
+            val settings = try { SettingsStore.fetch() } catch (e: Exception) { SettingsStore.cached() }
+            try { Anki.upload(ctx, settings) } catch (e: Exception) { }
+
             if (Usage.hasPermission(ctx)) {
                 val t = LocalDate.now()
                 // 어제 값도 한 번 더 올려서 자정 직전 사용분까지 확정
                 try { Repo.uploadUsage(t.minusDays(1).toString(), Usage.collect(ctx, t.minusDays(1))) } catch (e: Exception) { }
-                Repo.uploadUsage(day, Usage.collect(ctx, t))
-                checkLimits(ctx, day)
+                Repo.uploadUsage(t.toString(), Usage.collect(ctx, t))
+                try { uploadNight(ctx, t) } catch (e: Exception) { }
+                // 처음 한 번: 폰에 남아 있는 지난 7일치 사용 기록으로 캘린더 채우기
+                if (!Prefs.bool("backfill_v2")) try {
+                    for (i in 2..7) {
+                        val d = t.minusDays(i.toLong())
+                        Repo.uploadUsage(d.toString(), Usage.collect(ctx, d))
+                    }
+                    uploadNight(ctx, t.minusDays(2), days = 6)
+                    Prefs.putBool("backfill_v2", true)
+                } catch (e: Exception) { }
+                checkLimits(ctx, t.toString())
             }
+            try { Daily.refreshActive(ctx) } catch (e: Exception) { }
             Prefs.putLong("last_sync", System.currentTimeMillis())
+        }
+
+        /** 수면 계산용 0~12시 사용 구간 (오늘·어제) */
+        fun uploadNight(ctx: Context, t: LocalDate, days: Int = 2) {
+            val rows = org.json.JSONArray()
+            val now = java.time.OffsetDateTime.now().toString()
+            for (d in (days - 1 downTo 0).map { t.minusDays(it.toLong()) }) {
+                val arr = org.json.JSONArray()
+                Usage.nightSessions(ctx, d).forEach { arr.put(org.json.JSONArray().put(it[0]).put(it[1])) }
+                rows.put(
+                    org.json.JSONObject().put("user_id", Supa.userId).put("device_id", Prefs.deviceId)
+                        .put("day", d.toString()).put("sessions", arr).put("updated_at", now)
+                )
+            }
+            Supa.upsert("night_activity", rows, "user_id,device_id,day")
         }
 
         private fun checkLimits(ctx: Context, day: String) {

@@ -263,6 +263,7 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         Prefs.init(ctx)
         Reminders.scheduleNext(ctx)
+        Daily.scheduleNext(ctx)
         SyncJob.schedule(ctx)
     }
 }

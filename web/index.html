@@ -27,7 +27,8 @@
   <header class="topbar">
     <div class="brand">DailyOS</div>
     <nav id="tabs">
-      <button data-tab="today" class="active">오늘</button>
+      <button data-tab="calendar" class="active">캘린더</button>
+      <button data-tab="today">루틴</button>
       <button data-tab="report">리포트</button>
       <button data-tab="usage">사용량</button>
       <button data-tab="settings">설정</button>
@@ -35,7 +36,8 @@
     <button id="logout" class="ghost small">로그아웃</button>
   </header>
   <main>
-    <section id="tab-today" class="tab"></section>
+    <section id="tab-calendar" class="tab"></section>
+    <section id="tab-today" class="tab hidden"></section>
     <section id="tab-report" class="tab hidden"></section>
     <section id="tab-usage" class="tab hidden"></section>
     <section id="tab-settings" class="tab hidden"></section>
